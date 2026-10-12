@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+# tapectl - wrapper around reference LTFS for archiving a directory to LTO tape.
+# Runs inside the container. Configuration is via environment variables.
+set -euo pipefail
+
+TAPE_DEVICE="${TAPE_DEVICE:-/dev/sg1}"
+TAPE_MOUNT="${TAPE_MOUNT:-/mnt/tape}"
+TAPE_SOURCE="${TAPE_SOURCE:-/source}"
+LTFS_BIN="${LTFS_BIN:-ltfs}"
+# Format tool; auto-detected if empty (mkltfs, then mkaltfs)
+MKLTFS_BIN="${MKLTFS_BIN:-}"
+LTFS_OPTS="${LTFS_OPTS:-}"          # extra "-o" options, e.g. "noatime"
+RSYNC_EXTRA="${RSYNC_EXTRA:-}"      # extra rsync args
+
+log()  { printf '%s %s\n' "$(date '+%F %T')" "$*" >&2; }
+die()  { log "ERROR: $*"; exit 1; }
+
+MOUNTED_BY_US=0
+CHILD_PID=""
+
+usage() {
+  cat <<EOF
+Usage: tapectl <command> [options]
+
+Commands:
+  devices                    List tape devices visible to LTFS
+  format [--force] [--label NAME]
+                             Format the loaded tape (DESTROYS existing data)
+  archive [options]          Mount tape, rsync TAPE_SOURCE to it, verify, unmount
+      --dest NAME            Directory on tape (default: archive-<timestamp>)
+      --verify               Checksum-compare source and tape after copy
+      --dry-run              Show what rsync would do, write nothing
+      --exclude PATTERN      rsync exclude (repeatable)
+      --no-space-check       Skip the free-space check
+  ls [PATH]                  Mount read-only and list tape contents
+  shell                      Mount the tape and open an interactive shell;
+                             tape is cleanly unmounted when you exit
+  raw                        Interactive shell with NO automatic mount
+  help                       This text
+
+Environment:
+  TAPE_DEVICE=$TAPE_DEVICE  TAPE_MOUNT=$TAPE_MOUNT  TAPE_SOURCE=$TAPE_SOURCE
+  LTFS_OPTS, RSYNC_EXTRA, MKLTFS_BIN, LTFS_BIN
+
+Any unrecognised command is executed as-is (e.g. 'tapectl ltfs -o device_list').
+EOF
+}
+
+is_mounted() { mountpoint -q "$TAPE_MOUNT"; }
+
+mount_tape() {
+  local ro="${1:-}"
+  [[ -e "$TAPE_DEVICE" ]] || die "device $TAPE_DEVICE not present in container"
+  mkdir -p "$TAPE_MOUNT"
+  is_mounted && die "$TAPE_MOUNT is already mounted"
+  local opts="devname=$TAPE_DEVICE"
+  [[ -n "$ro" ]] && opts+=",ro"
+  [[ -n "$LTFS_OPTS" ]] && opts+=",$LTFS_OPTS"
+  log "Mounting $TAPE_DEVICE at $TAPE_MOUNT (this can take a minute while the tape loads)..."
+  "$LTFS_BIN" "$TAPE_MOUNT" -o "$opts" || die "mount failed (unformatted tape? try: tapectl format)"
+  local i
+  for ((i = 0; i < 120; i++)); do
+    is_mounted && { MOUNTED_BY_US=1; log "Mounted."; return 0; }
+    sleep 1
+  done
+  die "timed out waiting for mount"
+}
+
+unmount_tape() {
+  [[ $MOUNTED_BY_US -eq 1 ]] || return 0
+  MOUNTED_BY_US=0
+  is_mounted || return 0
+  log "Unmounting (flushing index to tape, do not interrupt)..."
+  sync || true
+  if ! fusermount -u "$TAPE_MOUNT" 2>/dev/null && ! fusermount3 -u "$TAPE_MOUNT" 2>/dev/null; then
+    umount "$TAPE_MOUNT" || { log "ERROR: unmount failed; tape index may not be written"; return 1; }
+  fi
+  # Wait for the ltfs process to finish writing the index
+  local i
+  for ((i = 0; i < 600; i++)); do
+    pgrep -x "$(basename "$LTFS_BIN")" >/dev/null 2>&1 || { log "Unmounted."; return 0; }
+    sleep 1
+  done
+  log "ERROR: ltfs still running after 10 minutes; tape index may not be written"
+  return 1
+}
+
+# Run a long command in the background and wait for it. Bash defers traps
+# until a foreground child exits, so a plain rsync would ignore SIGTERM
+# (podman stop / systemctl stop) until the copy finished or we got SIGKILLed.
+run_interruptible() {
+  "$@" &
+  CHILD_PID=$!
+  local rc=0
+  wait "$CHILD_PID" || rc=$?
+  CHILD_PID=""
+  return "$rc"
+}
+
+cleanup() {
+  local rc=$?
+  trap '' INT TERM
+  if [[ -n "$CHILD_PID" ]]; then
+    kill "$CHILD_PID" 2>/dev/null || true
+    wait "$CHILD_PID" 2>/dev/null || true
+  fi
+  unmount_tape || { [[ $rc -ne 0 ]] || rc=1; }
+  exit "$rc"
+}
+
+# Always try to cleanly unmount, including on Ctrl-C / SIGTERM (podman stop)
+trap 'cleanup' EXIT
+trap 'log "Interrupted"; exit 130' INT
+trap 'log "Terminated"; exit 143' TERM
+
+cmd_devices() { "$LTFS_BIN" -o device_list; }
+
+find_mkltfs() {
+  if [[ -n "$MKLTFS_BIN" ]]; then echo "$MKLTFS_BIN"; return; fi
+  local c
+  for c in mkltfs mkaltfs; do
+    command -v "$c" >/dev/null 2>&1 && { echo "$c"; return; }
+  done
+  die "no format tool found (looked for mkltfs, mkaltfs); set MKLTFS_BIN"
+}
+
+cmd_format() {
+  local force=0 label=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=1 ;;
+      --label) label="${2:?--label needs a value}"; shift ;;
+      *) die "unknown format option: $1" ;;
+    esac
+    shift
+  done
+  [[ $force -eq 1 ]] || die "formatting destroys all data on the tape; re-run with --force"
+  local mk; mk="$(find_mkltfs)"
+  # -f lets mkltfs reformat a tape that already has an LTFS volume
+  local args=(-d "$TAPE_DEVICE" -f)
+  [[ -n "$label" ]] && args+=(-n "$label")
+  log "Formatting with: $mk ${args[*]}"
+  "$mk" "${args[@]}"
+}
+
+cmd_archive() {
+  local dest verify=0 dry=0 space=1
+  dest="archive-$(date +%Y%m%d-%H%M%S)"
+  local excludes=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dest) dest="${2:?--dest needs a value}"; shift ;;
+      --verify) verify=1 ;;
+      --dry-run) dry=1 ;;
+      --exclude) excludes+=(--exclude "${2:?--exclude needs a value}"); shift ;;
+      --no-space-check) space=0 ;;
+      *) die "unknown archive option: $1" ;;
+    esac
+    shift
+  done
+  [[ -d "$TAPE_SOURCE" ]] || die "source $TAPE_SOURCE is not a directory (mount it with -v)"
+  [[ "$dest" != /* && "$dest" != *..* ]] || die "--dest must be a simple relative name"
+
+  mount_tape
+  local target="$TAPE_MOUNT/$dest"
+
+  if [[ $space -eq 1 && $dry -eq 0 ]]; then
+    local need avail
+    need=$(du -sb "${excludes[@]}" "$TAPE_SOURCE" 2>/dev/null | awk '{print $1}') || true
+    avail=$(df -B1 --output=avail "$TAPE_MOUNT" | tail -1 | tr -d ' ')
+    log "Source size: $need bytes; tape free: $avail bytes"
+    if [[ "$need" =~ ^[0-9]+$ && "$avail" =~ ^[0-9]+$ ]] && (( need > avail )); then
+      die "not enough space on tape (use --no-space-check to override)"
+    fi
+  fi
+
+  # LTFS has no unix owners/perms and is append-only: avoid in-place updates
+  # and partial files, which would waste capacity.
+  local rs=(rsync -rltv --no-perms --no-owner --no-group --whole-file --no-inplace
+            "--info=stats2,progress2" "${excludes[@]}")
+  [[ $dry -eq 1 ]] && rs+=(--dry-run)
+  # shellcheck disable=SC2206
+  [[ -n "$RSYNC_EXTRA" ]] && rs+=($RSYNC_EXTRA)
+
+  [[ $dry -eq 1 ]] || mkdir -p "$target"
+  log "Copying $TAPE_SOURCE/ -> tape:/$dest/"
+  run_interruptible "${rs[@]}" "$TAPE_SOURCE"/ "$target"/
+
+  if [[ $verify -eq 1 && $dry -eq 0 ]]; then
+    log "Verifying checksums (reads everything back from tape)..."
+    local diff_file rc=0
+    diff_file=$(mktemp)
+    run_interruptible rsync -rlcn --no-perms --no-owner --no-group --itemize-changes \
+      "${excludes[@]}" "$TAPE_SOURCE"/ "$target"/ >"$diff_file" || rc=$?
+    if [[ -s "$diff_file" ]]; then
+      cat "$diff_file" >&2
+      die "verification FAILED: differences listed above"
+    fi
+    [[ $rc -eq 0 ]] || die "verification FAILED: rsync exited with status $rc"
+    log "Verification OK."
+  fi
+
+  unmount_tape || die "unmount failed; the archive may not be readable (try ltfsck)"
+  log "Archive complete: /$dest"
+}
+
+cmd_ls() {
+  mount_tape ro
+  ls -lah "$TAPE_MOUNT/${1:-}"
+}
+
+cmd_shell() {
+  mount_tape
+  log "Tape mounted at $TAPE_MOUNT. Exit the shell to unmount cleanly."
+  cd "$TAPE_MOUNT"
+  bash -i || true
+  cd /
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  devices) cmd_devices ;;
+  format)  cmd_format "$@" ;;
+  archive) cmd_archive "$@" ;;
+  ls)      cmd_ls "$@" ;;
+  shell)   cmd_shell ;;
+  raw)     exec bash -i ;;
+  help|-h|--help) usage ;;
+  *)       exec "$cmd" "$@" ;;
+esac

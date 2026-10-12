@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly tape archive
+
+[Timer]
+OnCalendar=Sun *-*-* 02:00:00
+Persistent=true
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target
