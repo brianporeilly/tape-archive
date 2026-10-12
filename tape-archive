@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Host-side wrapper: runs the tape-archive container with the right flags.
+# Install on Fedora CoreOS at /var/usrlocal/bin/tape-archive (== /usr/local/bin).
+#
+# Usage: tape-archive [tapectl args...]
+#   tape-archive devices
+#   tape-archive format --force --label ARCHIVE01
+#   tape-archive archive --verify
+#   tape-archive shell              # interactive
+#
+# Config (env, or /etc/tape-archive.env):
+#   TAPE_IMAGE   image to run            (default ghcr.io/brianporeilly/tape-archive:latest)
+#   TAPE_DEVICE  sg device on the host   (default /dev/sg1)
+#   TAPE_SOURCE  host dir, NFS mount, or podman volume name to archive
+set -euo pipefail
+
+# Variables already set in the environment win over the env file
+if [[ -f /etc/tape-archive.env ]]; then
+  preset="$(export -p)"
+  set -a
+  # shellcheck disable=SC1091
+  . /etc/tape-archive.env
+  set +a
+  eval "$preset"
+fi
+
+TAPE_IMAGE="${TAPE_IMAGE:-ghcr.io/brianporeilly/tape-archive:latest}"
+TAPE_DEVICE="${TAPE_DEVICE:-/dev/sg1}"
+TAPE_SOURCE="${TAPE_SOURCE:-}"
+
+args=(run --rm --name tape-archive
+      --device "$TAPE_DEVICE" --device /dev/fuse
+      --cap-add SYS_ADMIN
+      --security-opt label=disable
+      -e "TAPE_DEVICE=$TAPE_DEVICE")
+
+# Interactive only when attached to a terminal (so it also works from systemd/cron)
+[[ -t 0 && -t 1 ]] && args+=(-it)
+
+# Pass through optional tuning variables if set
+for v in LTFS_OPTS RSYNC_EXTRA MKLTFS_BIN; do
+  [[ -n "${!v:-}" ]] && args+=(-e "$v=${!v}")
+done
+
+if [[ -n "$TAPE_SOURCE" ]]; then
+  args+=(-v "$TAPE_SOURCE:/source:ro")
+fi
+
+# Give the container time to unmount and write the LTFS index on SIGTERM
+args+=(--stop-timeout 600)
+
+[[ $EUID -eq 0 ]] || exec sudo podman "${args[@]}" "$TAPE_IMAGE" "$@"
+exec podman "${args[@]}" "$TAPE_IMAGE" "$@"

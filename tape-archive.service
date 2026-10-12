@@ -1,0 +1,15 @@
+[Unit]
+Description=Archive data to LTO tape via LTFS
+After=network-online.target
+Wants=network-online.target
+# If the source is a host NFS mount, uncomment and adjust:
+# RequiresMountsFor=/var/mnt/nfs-source
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/tape-archive.env
+# flock prevents two runs fighting over the drive
+ExecStart=/usr/bin/flock -n /run/tape-archive.lock /var/usrlocal/bin/tape-archive archive --verify
+# Allow time for tape load, large copies, verify, and index write
+TimeoutStartSec=infinity
+TimeoutStopSec=15min
